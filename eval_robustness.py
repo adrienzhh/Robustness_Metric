@@ -20,6 +20,7 @@ from scipy.spatial.transform import Rotation
 from evo.core.metrics import PoseRelation
 import evo.main_rpe as main_rpe
 import numpy as np
+import math
 
 from scipy.interpolate import interp1d
 from scipy.spatial.transform import Rotation, Slerp
@@ -193,12 +194,50 @@ def process_trajectory_pair(ref_file, est_file, config):
     print(f"  > GT Frames (Total Mission): {total_gt_frames}")
     print(f"  > Est Frames (Submitted):    {len(traj_est.positions_xyz)}")
 
-    # --- 3. Synchronization ---
-    max_diff = 0.2
+    # --- 3. [THE FIX] Interpolate Sparse Estimated Trajectory ---
+    # If estimate is sparse, we interpolate it to match the high-frequency Ground Truth.
+    # This removes penalties for low update rates while preserving trajectory shape error.
+    
+    # 3a. Interpolate Position (Linear)
+    # Using interp1d with extrapolation might be dangerous if timestamps don't align perfectly at ends,
+    # but sync.associate usually handles the intersection. We interpolate over the whole range first.
+    t_est = np.array(traj_est.timestamps)
+    pos_est = np.array(traj_est.positions_xyz)
+    
+    # Check if we need interpolation (if est density is much lower than GT)
+    # E.g., if GT has 10x more frames
+    if total_gt_frames > 2 * len(traj_est.positions_xyz):
+        print("  > Detected sparse trajectory. Interpolating to GT timestamps...")
+        
+        # We only interpolate at GT timestamps that fall within the Est time range
+        # to avoid wild extrapolation.
+        t_ref = np.array(traj_ref.timestamps)
+        valid_mask = (t_ref >= t_est[0]) & (t_ref <= t_est[-1])
+        t_target = t_ref[valid_mask]
+        
+        # Linear Position Interpolation
+        fx = interp1d(t_est, pos_est[:,0], kind='linear')
+        fy = interp1d(t_est, pos_est[:,1], kind='linear')
+        fz = interp1d(t_est, pos_est[:,2], kind='linear')
+        new_pos = np.vstack((fx(t_target), fy(t_target), fz(t_target))).T
+        
+        # Slerp Rotation Interpolation
+        quat_est_wxyz = np.array(traj_est.orientations_quat_wxyz)
+        # scipy needs [x, y, z, w]
+        quat_est_xyzw = np.roll(quat_est_wxyz, -1, axis=1)
+        rot_spline = Slerp(t_est, Rotation.from_quat(quat_est_xyzw))
+        new_rot_xyzw = rot_spline(t_target).as_quat()
+        # convert back to [w, x, y, z]
+        new_rot_wxyz = np.roll(new_rot_xyzw, 1, axis=1)
+        
+        # Create new dense trajectory object
+        traj_est = PoseTrajectory3D(new_pos, new_rot_wxyz, t_target)
+        print(f"  > Interpolated Est Frames: {len(traj_est.positions_xyz)}")
+
+    # --- 4. Synchronization ---
+    max_diff = 0.05 # Reduced tolerance since we now have aligned timestamps (if interpolated)
     
     # Associate trajectories (Align by timestamp)
-    # Note: This truncates the reference to match the estimation.
-    # If est died at 34s, traj_ref_synced will also end at 34s.
     traj_ref_synced, traj_est_synced = sync.associate_trajectories(traj_ref, traj_est, max_diff)
     
     matched_count = len(traj_ref_synced.positions_xyz)
@@ -212,7 +251,7 @@ def process_trajectory_pair(ref_file, est_file, config):
             'fscore_area_trans': 0.0, 'fscore_area_rot': 0.0
         }
 
-    # --- 4. Calculate RPE (Translation) ---
+    # --- 5. Calculate RPE (Translation) ---
     # Using main_rpe wrapper ensures consistent unit scaling and alignment
     result_trans = main_rpe.rpe(
         traj_ref_synced, traj_est_synced,
@@ -253,8 +292,17 @@ def process_trajectory_pair(ref_file, est_file, config):
     else:
         est_rate = 0.0
 
-    # Calculate expected number of intervals if the estimation covered the full GT duration
+    # [FIX] If we interpolated, the 'est_rate' matches GT rate, so 'expected' should match GT count.
+    # However, to be robust, we just calculate based on duration ratio.
+    # If we interpolated to GT timestamps, 'est_rate' might be slightly off due to gaps,
+    # but more importantly, we shouldn't expect MORE than GT frames if we are just matching GT.
+    
     expected_error_count = int(est_rate * gt_duration)
+    
+    # Cap expected count to GT count if we interpolated (to avoid double penalty)
+    # We assume if we have > 90% of GT frames, we intended to match GT frequency.
+    if len(traj_est.positions_xyz) > 0.9 * total_gt_frames:
+         expected_error_count = min(expected_error_count, total_gt_frames - 1)
 
     actual_error_count = len(rpe_trans_errors)
     
@@ -283,13 +331,19 @@ def process_trajectory_pair(ref_file, est_file, config):
     calc_len = len(rpe_trans_final)
 
     # --- 7. Calculate Metrics ---
-    # We use the config-defined limits for the single-point result (usually the strict end)
-    trans_threshold = config.get_float('parameters.trans_threshold_end', 1.0)
-    rot_threshold = config.get_float('parameters.rot_threshold_end', 10.0)
+    # For single-point results, we pick a "Reasonable" threshold (e.g., x=0.5)
+    trans_max = config.get_float('parameters.trans_max_effective_error', 1.0)
+    rot_max   = config.get_float('parameters.rot_max_effective_error', 30.0)
+    scale_trans = trans_max / 3.0
+    scale_rot = rot_max / 3.0
+    
+    # Threshold at x=0.5 -> E = -scale * ln(0.5) ~= scale * 0.693
+    trans_mid = -scale_trans * math.log(0.5)
+    rot_mid   = -scale_rot * math.log(0.5)
 
     fscore_trans, fscore_rot = RobustnessMetric.calc_fscore(
         rpe_trans_final, rpe_rot_final,
-        calc_len, trans_threshold, rot_threshold
+        calc_len, trans_mid, rot_mid
     )
 
     auc_result = RobustnessMetric.eval_robustness_batch(
