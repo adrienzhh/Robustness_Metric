@@ -1,3 +1,12 @@
+"""
+Robustness Metric Module
+
+This module provides the RobustnessMetric class for evaluating trajectory estimation robustness.
+It implements F-score calculation and Area Under Curve (AUC) computation for assessing the
+quality of trajectory estimates across multiple error thresholds.
+
+"""
+
 import torch
 import os
 import csv
