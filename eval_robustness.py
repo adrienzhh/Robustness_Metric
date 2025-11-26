@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+import pandas as pd
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(script_dir, 'script'))
@@ -22,36 +23,137 @@ import numpy as np
 
 from scipy.interpolate import interp1d
 from scipy.spatial.transform import Rotation, Slerp
-from evo.core.trajectory import PosePath3D
+from evo.core.trajectory import PosePath3D, PoseTrajectory3D
 import numpy as np
-
-
 
 print(f"Current working directory: {os.getcwd()}")
 
-def resample_ground_truth(traj_ref, target_timestamps):
-   
-    
-    t_ref = np.array(traj_ref.timestamps)              
-    pts   = np.array(traj_ref.positions_xyz)           
-    fx = interp1d(t_ref, pts[:,0], kind='linear', fill_value='extrapolate')
-    fy = interp1d(t_ref, pts[:,1], kind='linear', fill_value='extrapolate')
-    fz = interp1d(t_ref, pts[:,2], kind='linear', fill_value='extrapolate')
-    t_tgt = np.array(target_timestamps)                
-    new_pts = np.vstack((fx(t_tgt), fy(t_tgt), fz(t_tgt))).T  
+def read_trajectory_file(filepath):
+    """
+    Read trajectory file supporting both CSV and TUM formats.
+    Automatically converts nanosecond timestamps to seconds.
 
-    
-    quats = np.array(traj_ref.orientations_quat)       
-    rot_seq = Rotation.from_quat(quats)
-    slerp   = Slerp(t_ref, rot_seq)
-    new_rots = slerp(t_tgt)                            
-    new_quats = new_rots.as_quat().tolist()            
+    CSV format expected: timestamp, x, y, z, qx, qy, qz, qw
+    TUM format: timestamp x y z qx qy qz qw
+    """
+    file_ext = os.path.splitext(filepath)[1].lower()
 
-    return PosePath3D(
-        positions_xyz=new_pts.tolist(),
-        orientations=new_quats,
-        timestamps=t_tgt.tolist()
-    )
+    if file_ext == '.csv':
+        # Read CSV file
+        df = pd.read_csv(filepath)
+
+        # Handle different possible column names
+        possible_timestamp_cols = ['timestamp', 'time', 't', 'Timestamp', 'Time']
+        timestamp_col = None
+        for col in possible_timestamp_cols:
+            if col in df.columns:
+                timestamp_col = col
+                break
+
+        if timestamp_col is None:
+            # Assume first column is timestamp
+            timestamp_col = df.columns[0]
+
+        timestamps = df[timestamp_col].values
+
+        # Convert nanoseconds to seconds if needed (nanoseconds are typically > 1e10)
+        if timestamps[0] > 1e10:
+            print(f"Converting timestamps from nanoseconds to seconds for {filepath}")
+            timestamps = timestamps / 1e9
+
+        # Try to extract position and orientation columns
+        # Common formats: x,y,z,qx,qy,qz,qw or tx,ty,tz,qx,qy,qz,qw
+        position_cols = []
+        orientation_cols = []
+
+        # Look for position columns
+        for x_col in ['x', 'tx', 'X', 'pos_x']:
+            if x_col in df.columns:
+                y_col = x_col.replace('x', 'y').replace('X', 'Y')
+                z_col = x_col.replace('x', 'z').replace('X', 'Z')
+                if y_col in df.columns and z_col in df.columns:
+                    position_cols = [x_col, y_col, z_col]
+                    break
+
+        # If not found, try using column indices
+        if not position_cols:
+            if len(df.columns) >= 8:
+                position_cols = [df.columns[1], df.columns[2], df.columns[3]]
+
+        # Look for orientation columns (quaternion: qx, qy, qz, qw)
+        for qx_col in ['qx', 'QX', 'q_x', 'ori_x']:
+            if qx_col in df.columns:
+                qy_col = qx_col.replace('x', 'y').replace('X', 'Y')
+                qz_col = qx_col.replace('x', 'z').replace('X', 'Z')
+                qw_col = qx_col.replace('x', 'w').replace('X', 'W')
+                if qy_col in df.columns and qz_col in df.columns and qw_col in df.columns:
+                    orientation_cols = [qx_col, qy_col, qz_col, qw_col]
+                    break
+
+        # If not found, try using column indices
+        if not orientation_cols:
+            if len(df.columns) >= 8:
+                orientation_cols = [df.columns[4], df.columns[5], df.columns[6], df.columns[7]]
+
+        positions = df[position_cols].values
+        orientations = df[orientation_cols].values
+
+        # CSV quaternions might be in [x, y, z, w] or [w, x, y, z] format
+        # We need [w, x, y, z] format for evo's PoseTrajectory3D
+        # Check if first quaternion's last component looks like w (close to ±1 or normalized)
+        sample_quat = orientations[0]
+        quat_norm = np.linalg.norm(sample_quat)
+
+        # If the quaternion is in [x, y, z, w] format (scipy convention), reorder to [w, x, y, z]
+        # Heuristic: if last element has larger absolute value, it's likely the w component
+        if abs(sample_quat[3]) > abs(sample_quat[0]):
+            # Assume [x, y, z, w] format, convert to [w, x, y, z]
+            orientations = np.roll(orientations, 1, axis=1)
+
+        # Create PoseTrajectory3D trajectory (positions, quaternions_wxyz, timestamps)
+        return PoseTrajectory3D(positions, orientations, timestamps)
+    else:
+        # Use existing TUM reader for .txt or other formats
+        traj = file_interface.read_tum_trajectory_file(filepath)
+
+        # Check if timestamps are in nanoseconds and convert to seconds
+        if len(traj.timestamps) > 0 and traj.timestamps[0] > 1e10:
+            print(f"Converting timestamps from nanoseconds to seconds for {filepath}")
+            timestamps = np.array(traj.timestamps) / 1e9
+            # evo uses [w, x, y, z] format for quaternions
+            # PoseTrajectory3D(positions, quaternions_wxyz, timestamps)
+            return PoseTrajectory3D(
+                traj.positions_xyz,
+                traj.orientations_quat_wxyz,
+                timestamps
+            )
+
+        return traj
+
+# def resample_ground_truth(traj_ref, target_timestamps):
+
+#     t_ref = np.array(traj_ref.timestamps)
+#     pts   = np.array(traj_ref.positions_xyz)
+#     fx = interp1d(t_ref, pts[:,0], kind='linear', fill_value='extrapolate')
+#     fy = interp1d(t_ref, pts[:,1], kind='linear', fill_value='extrapolate')
+#     fz = interp1d(t_ref, pts[:,2], kind='linear', fill_value='extrapolate')
+#     t_tgt = np.array(target_timestamps)
+#     new_pts = np.vstack((fx(t_tgt), fy(t_tgt), fz(t_tgt))).T
+
+
+#     # evo uses [w, x, y, z] format, scipy uses [x, y, z, w]
+#     quats_wxyz = np.array(traj_ref.orientations_quat_wxyz)
+#     # Convert from [w, x, y, z] to [x, y, z, w] for scipy
+#     quats_xyzw = np.roll(quats_wxyz, -1, axis=1)
+#     rot_seq = Rotation.from_quat(quats_xyzw)
+#     slerp   = Slerp(t_ref, rot_seq)
+#     new_rots = slerp(t_tgt)
+#     # Convert back from [x, y, z, w] to [w, x, y, z] for evo
+#     new_quats_xyzw = new_rots.as_quat()
+#     new_quats_wxyz = np.roll(new_quats_xyzw, 1, axis=1)
+
+#     # PoseTrajectory3D(positions, quaternions_wxyz, timestamps)
+#     return PoseTrajectory3D(new_pts, new_quats_wxyz, t_tgt)
 
 def load_config(config_path):
     if not os.path.exists(config_path):
@@ -76,50 +178,107 @@ def format_results(auc_result):
     return result
 
 def process_trajectory_pair(ref_file, est_file, config):
+    # --- 1. Load Configuration ---
+    # Default values are safe safeguards if config is missing keys
+    trans_threshold = config.get_float('parameters.trans_threshold', 0.01)
+    rot_threshold = config.get_float('parameters.rot_threshold', 0.01)
+    
+    threshold_start = config.get_float('parameters.threshold_start', 0.0)
+    threshold_end = config.get_float('parameters.threshold_end', 1.0)
+    # Ensure interval is not zero to avoid infinite loops
+    threshold_interval = config.get('parameters.threshold_interval', 
+                                    threshold_start if threshold_start > 0 else 0.01)
+
+    # --- 2. Read Files ---
+    traj_ref = read_trajectory_file(ref_file)
+    traj_est = read_trajectory_file(est_file)
+
+    # [CRITICAL STEP] 
+    # Capture the full length of the Ground Truth *before* synchronization.
+    # This represents the full mission duration.
+    total_gt_frames = len(traj_ref.positions_xyz)
+    print(f"  > GT Frames (Total Mission): {total_gt_frames}")
+    print(f"  > Est Frames (Submitted):    {len(traj_est.positions_xyz)}")
+
+    # --- 3. Synchronization ---
     max_diff = 0.2
-    trans_threshold = 0.1
-    rot_threshold = 0.1
-    threshold_start = config.get_float('parameters.threshold_start')
-    threshold_end = config.get_float('parameters.threshold_end')
-    threshold_interval = threshold_start * 2
+    
+    # Associate trajectories (Align by timestamp)
+    # Note: This truncates the reference to match the estimation.
+    # If est died at 34s, traj_ref_synced will also end at 34s.
+    traj_ref_synced, traj_est_synced = sync.associate_trajectories(traj_ref, traj_est, max_diff)
+    
+    matched_count = len(traj_ref_synced.positions_xyz)
+    print(f"  > Matched Frames (Survived): {matched_count}")
 
-    traj_ref = file_interface.read_tum_trajectory_file(ref_file)
-    traj_est = file_interface.read_tum_trajectory_file(est_file)
+    # Safety check: If association failed or too few matches
+    if matched_count < 2:
+        print("  ! WARNING: Too few matches found. Returning zero scores.")
+        return 0.0, 0.0, {
+            'thresholds': [], 'fscore_transes': [], 'fscore_rots': [], 
+            'fscore_area_trans': 0.0, 'fscore_area_rot': 0.0
+        }
 
-    offset_2 = abs(traj_est.timestamps[0] - traj_ref.timestamps[0])
-    offset_2 *= -1 if traj_est.timestamps[0] > traj_ref.timestamps[0] else 1
-
-    traj_ref, traj_est = sync.associate_trajectories(traj_ref, traj_est, max_diff, offset_2)
-    full_len = len(traj_ref.positions_xyz)
-    print("Matched frames count:", full_len)
-    print("Est Size:", len(traj_est.positions_xyz))
-
+    # --- 4. Calculate RPE (Translation) ---
+    # Using main_rpe wrapper ensures consistent unit scaling and alignment
     result_trans = main_rpe.rpe(
-        traj_ref, traj_est,
+        traj_ref_synced, traj_est_synced,
         est_name='RPE translation',
         pose_relation=PoseRelation.translation_part,
         delta=1.0, delta_unit=Unit.frames,
         all_pairs=False, align=True, correct_scale=False,
         support_loop=False
     )
-    rpe_trans_result = result_trans.np_arrays["error_array"]
+    rpe_trans_errors = result_trans.np_arrays["error_array"]
 
-    rpe_rot = metrics.RPE(
-        PoseRelation.rotation_angle_deg,
+    # --- 5. Calculate RPE (Rotation) ---
+    result_rot = main_rpe.rpe(
+        traj_ref_synced, traj_est_synced,
+        est_name='RPE rotation',
+        pose_relation=PoseRelation.rotation_angle_deg,
         delta=1.0, delta_unit=Unit.frames,
-        all_pairs=False
+        all_pairs=False, align=True, correct_scale=False,
+        support_loop=False
     )
-    rpe_rot.process_data((traj_ref, traj_est))
-    rpe_rot_result = np.radians(rpe_rot.error)
+    rpe_rot_errors = result_rot.np_arrays["error_array"]
 
+    # --- 6. [THE FIX] Pad Missing Frames with High Error ---
+    # We compare the number of errors we got vs the number of errors expected 
+    # if the robot had completed the full 32m trajectory.
+    
+    # RPE (delta=1) produces (N-1) errors for N frames.
+    expected_error_count = total_gt_frames - 1
+    actual_error_count = len(rpe_trans_errors)
+    
+    # Calculate how many frames were lost (the "dead" period)
+    missing_count = max(0, expected_error_count - actual_error_count)
+
+    if missing_count > 0:
+        print(f"  > Padding {missing_count} lost frames with infinite error.")
+        print("    (This corrects the AUC to account for early failure)")
+        
+        # Create an array of large errors (10,000.0 is effectively infinite for AUC < 1.0m)
+        padding = np.full(missing_count, 10000.0)
+        
+        # Concatenate the actual errors (from the alive part) with the padding (dead part)
+        rpe_trans_final = np.concatenate((rpe_trans_errors, padding))
+        rpe_rot_final = np.concatenate((rpe_rot_errors, padding))
+    else:
+        rpe_trans_final = rpe_trans_errors
+        rpe_rot_final = rpe_rot_errors
+
+    # Verify length for the metric calculator
+    calc_len = len(rpe_trans_final)
+
+    # --- 7. Calculate Metrics ---
     fscore_trans, fscore_rot = RobustnessMetric.calc_fscore(
-        rpe_trans_result, rpe_rot_result,
-        full_len, trans_threshold, rot_threshold
+        rpe_trans_final, rpe_rot_final,
+        calc_len, trans_threshold, rot_threshold
     )
 
     auc_result = RobustnessMetric.eval_robustness_batch(
-        rpe_trans_result, rpe_rot_result,
-        full_len, threshold_start, threshold_end, threshold_interval
+        rpe_trans_final, rpe_rot_final,
+        calc_len, threshold_start, threshold_end, threshold_interval
     )
 
     return fscore_trans, fscore_rot, auc_result

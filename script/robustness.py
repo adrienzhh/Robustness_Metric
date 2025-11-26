@@ -1,6 +1,23 @@
-import torch
+"""
+Robustness Metric Module
+
+This module provides the RobustnessMetric class for evaluating trajectory estimation robustness.
+It implements F-score calculation and Area Under Curve (AUC) computation for assessing the
+quality of SLAM/VIO trajectory estimates across multiple error thresholds.
+
+Key Components:
+- calc_fscore: Computes F-score from RPE (Relative Pose Error) metrics
+- eval_robustness_batch: Evaluates robustness across multiple threshold levels and computes AUC
+- save_results: Exports robustness metrics to CSV files
+- plot_robustness_metrics: Generates visualization plots showing F-score vs threshold curves
+
+The robustness metric quantifies how well a trajectory estimate performs across different
+error tolerance levels, providing a comprehensive assessment beyond single-threshold metrics.
+"""
+
 import os
 import csv
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 from pyhocon import ConfigFactory
@@ -20,10 +37,10 @@ class RobustnessMetric:
         Calculate the F-score for using velocity and angular velocity pair
 
         Parameters:
-        trans_deriv1 (list of torch.Tensor): estimate translational derivatives
-        rot_deriv1 (list of torch.Tensor): estimated angular 
-        trans_deriv2 (list of torch.Tensor): GT translational derivatives
-        rot_deriv2 (list of torch.Tensor): GT angular 
+        trans_deriv1 (list): estimate translational derivatives
+        rot_deriv1 (list): estimated angular 
+        trans_deriv2 (list): GT translational derivatives
+        rot_deriv2 (list): GT angular 
         trans_threshold (float)
         rot_threshold (float)
         Returns:
@@ -39,8 +56,8 @@ class RobustnessMetric:
             x2, y2, z2 = trans_deriv2[index]
             rx2, ry2, rz2 = rot_deriv2[index]
 
-            trans_val = torch.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
-            rot_val = torch.sqrt((rx1-rx2)**2 + (ry1-ry2)**2 + (rz1-rz2)**2)
+            trans_val = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+            rot_val = math.sqrt((rx1-rx2)**2 + (ry1-ry2)**2 + (rz1-rz2)**2)
 
             if trans_val <= trans_threshold:
                 trans_num += 1
@@ -119,10 +136,14 @@ class RobustnessMetric:
         
         threshold = threshold_start
         while threshold <= threshold_end:
-            threshold_value = torch.exp(torch.tensor(-10.0 * threshold))
+            threshold_value = math.exp(-10.0 * threshold)
             fscore_trans, fscore_rot = RobustnessMetric.calc_fscore(
                 rpe_trans, rpe_rots, full_len, threshold_value, threshold_value)
-            x_axis_len = torch.exp(torch.tensor(-10.0 * (threshold - threshold_interval * 0.5))) - torch.exp(torch.tensor(-10.0 * (threshold + threshold_interval * 0.5)))
+            
+            val_minus = math.exp(-10.0 * (threshold - threshold_interval * 0.5))
+            val_plus = math.exp(-10.0 * (threshold + threshold_interval * 0.5))
+            x_axis_len = val_minus - val_plus
+            
             if (threshold - threshold_interval * 0.5) < 0.0:
                 x_axis_len = 0.0
             fscore_area_trans += fscore_trans * x_axis_len
@@ -161,8 +182,8 @@ class RobustnessMetric:
                 writer.writerow([f'{t:.3f}', f'{ft:.4f}', f'{fr:.4f}'])
             
             writer.writerow([])  
-            writer.writerow(['AUC (Trans)', f"{auc_result['fscore_area_trans'].item():.4f}"])
-            writer.writerow(['AUC (Rot)', f"{auc_result['fscore_area_rot'].item():.4f}"])
+            writer.writerow(['AUC (Trans)', f"{auc_result['fscore_area_trans']:.4f}"])
+            writer.writerow(['AUC (Rot)', f"{auc_result['fscore_area_rot']:.4f}"])
 
         print(f"Results saved to: {result_file}")
 
