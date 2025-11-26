@@ -2,16 +2,18 @@ import sys
 import os
 import argparse
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Set non-interactive backend for headless environments
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(script_dir, 'script'))
 sys.path.append(os.path.join(script_dir, 'python_wrapper'))
 
+from evo.tools.settings import SETTINGS
+SETTINGS.plot_backend = 'Agg'
 from evo.core import metrics, trajectory
 from evo.core.units import Unit
 from evo.tools import log, plot, file_interface
-from evo.tools.settings import SETTINGS
-from evo.core import sync
 from robustness import RobustnessMetric
 from pyhocon import ConfigFactory
 import matplotlib.pyplot as plt
@@ -178,6 +180,50 @@ def format_results(auc_result):
     result += f"AUC (Rot)  : {fscore_area_rot:.4f}\n"
     return result
 
+def align_estimator_to_gt(traj_ref, traj_est):
+    """
+    Align the estimated trajectory to GT timestamps by reusing the closest pose.
+    This allows low-frequency estimators to be evaluated fairly while still
+    penalizing large gaps via translation/rotation error.
+    """
+    t_ref = np.array(traj_ref.timestamps)
+    t_est = np.array(traj_est.timestamps)
+
+    if len(t_ref) == 0 or len(t_est) == 0:
+        return None, None, np.array([], dtype=bool)
+
+    min_est = t_est[0]
+    max_est = t_est[-1]
+
+    valid_mask = (t_ref >= min_est) & (t_ref <= max_est)
+    if not np.any(valid_mask):
+        return None, None, valid_mask
+
+    t_overlap = t_ref[valid_mask]
+
+    candidate_idx = np.searchsorted(t_est, t_overlap, side='left')
+    candidate_idx = np.clip(candidate_idx, 0, len(t_est) - 1)
+    prev_idx = np.clip(candidate_idx - 1, 0, len(t_est) - 1)
+
+    use_prev = (
+        (candidate_idx > 0)
+        & (
+            np.abs(t_est[prev_idx] - t_overlap)
+            < np.abs(t_est[candidate_idx] - t_overlap)
+        )
+    )
+    candidate_idx[use_prev] = prev_idx[use_prev]
+
+    ref_positions = np.array(traj_ref.positions_xyz)[valid_mask]
+    ref_rotations = np.array(traj_ref.orientations_quat_wxyz)[valid_mask]
+    matched_positions = np.array(traj_est.positions_xyz)[candidate_idx]
+    matched_rotations = np.array(traj_est.orientations_quat_wxyz)[candidate_idx]
+
+    traj_ref_synced = PoseTrajectory3D(ref_positions, ref_rotations, t_overlap)
+    traj_est_synced = PoseTrajectory3D(matched_positions, matched_rotations, t_overlap)
+
+    return traj_ref_synced, traj_est_synced, valid_mask
+
 def process_trajectory_pair(ref_file, est_file, config):
     # --- 1. Load Configuration ---
     # Default values are safe safeguards if config is missing keys
@@ -200,7 +246,7 @@ def process_trajectory_pair(ref_file, est_file, config):
     
     # 3a. Interpolate Position (Linear)
     # Using interp1d with extrapolation might be dangerous if timestamps don't align perfectly at ends,
-    # but sync.associate usually handles the intersection. We interpolate over the whole range first.
+    # but a later alignment pass will handle the intersection. We interpolate over the whole range first.
     t_est = np.array(traj_est.timestamps)
     pos_est = np.array(traj_est.positions_xyz)
     
@@ -212,6 +258,13 @@ def process_trajectory_pair(ref_file, est_file, config):
         # We only interpolate at GT timestamps that fall within the Est time range
         # to avoid wild extrapolation.
         t_ref = np.array(traj_ref.timestamps)
+        
+        # [CRITICAL] Ensure unique timestamps in GT before interpolation
+        # Some datasets (or parsing) might produce duplicate timestamps, leading to double counting
+        t_ref, unique_indices = np.unique(t_ref, return_index=True)
+        # We need to filter positions/orientations too if we were using t_ref for more than just lookup
+        # But here we just use t_ref to find target timestamps.
+        
         valid_mask = (t_ref >= t_est[0]) & (t_ref <= t_est[-1])
         t_target = t_ref[valid_mask]
         
@@ -234,22 +287,20 @@ def process_trajectory_pair(ref_file, est_file, config):
         traj_est = PoseTrajectory3D(new_pos, new_rot_wxyz, t_target)
         print(f"  > Interpolated Est Frames: {len(traj_est.positions_xyz)}")
 
-    # --- 4. Synchronization ---
-    max_diff = 0.05 # Reduced tolerance since we now have aligned timestamps (if interpolated)
+    # --- 4. Synchronization via Nearest-Neighbor Reuse ---
+    traj_ref_synced, traj_est_synced, _ = align_estimator_to_gt(traj_ref, traj_est)
     
-    # Associate trajectories (Align by timestamp)
-    traj_ref_synced, traj_est_synced = sync.associate_trajectories(traj_ref, traj_est, max_diff)
-    
-    matched_count = len(traj_ref_synced.positions_xyz)
-    print(f"  > Matched Frames (Survived): {matched_count}")
-
-    # Safety check: If association failed or too few matches
-    if matched_count < 2:
-        print("  ! WARNING: Too few matches found. Returning zero scores.")
+    if traj_ref_synced is None or len(traj_ref_synced.positions_xyz) < 2:
+        print("  ! WARNING: Could not find overlapping timestamps. Returning zero scores.")
         return 0.0, 0.0, {
             'thresholds': [], 'fscore_transes': [], 'fscore_rots': [], 
             'fscore_area_trans': 0.0, 'fscore_area_rot': 0.0
         }
+    
+    matched_count = len(traj_ref_synced.positions_xyz)
+    coverage_ratio = matched_count / total_gt_frames if total_gt_frames > 0 else 0.0
+    print(f"  > Matched Frames (Reuse allowed): {matched_count}")
+    print(f"  > Coverage Ratio: {coverage_ratio*100:.2f}% of GT timeline")
 
     # --- 5. Calculate RPE (Translation) ---
     # Using main_rpe wrapper ensures consistent unit scaling and alignment
@@ -278,77 +329,34 @@ def process_trajectory_pair(ref_file, est_file, config):
     print(f"  [DEBUG] RPE Translation Stats: Min={np.min(rpe_trans_errors):.4f}, Mean={np.mean(rpe_trans_errors):.4f}, Max={np.max(rpe_trans_errors):.4f}")
     print(f"  [DEBUG] RPE Rotation Stats:    Min={np.min(rpe_rot_errors):.4f}, Mean={np.mean(rpe_rot_errors):.4f}, Max={np.max(rpe_rot_errors):.4f}")
 
-    # --- 6. [THE FIX] Pad Missing Frames based on Duration ---
-    # Instead of expecting every single GT frame, we expect the estimation 
-    # to maintain its own frequency over the full duration of the GT.
-
+    # --- 6. Coverage Diagnostics (No artificial padding) ---
     gt_duration = traj_ref.timestamps[-1] - traj_ref.timestamps[0]
     est_duration = traj_est.timestamps[-1] - traj_est.timestamps[0]
-    
-    # Calculate density (intervals per second) of the estimated trajectory
-    # Avoid division by zero
-    if est_duration > 1e-6:
-        est_rate = (len(traj_est.timestamps) - 1) / est_duration
-    else:
-        est_rate = 0.0
-
-    # [FIX] If we interpolated, the 'est_rate' matches GT rate, so 'expected' should match GT count.
-    # However, to be robust, we just calculate based on duration ratio.
-    # If we interpolated to GT timestamps, 'est_rate' might be slightly off due to gaps,
-    # but more importantly, we shouldn't expect MORE than GT frames if we are just matching GT.
-    
-    expected_error_count = int(est_rate * gt_duration)
-    
-    # Cap expected count to GT count if we interpolated (to avoid double penalty)
-    # We assume if we have > 90% of GT frames, we intended to match GT frequency.
-    if len(traj_est.positions_xyz) > 0.9 * total_gt_frames:
-         expected_error_count = min(expected_error_count, total_gt_frames - 1)
-
-    actual_error_count = len(rpe_trans_errors)
-    
     print(f"  > Duration GT: {gt_duration:.2f}s, Est: {est_duration:.2f}s")
-    print(f"  > Expected Count (Duration-based): {expected_error_count}")
-    print(f"  > Actual Count (Matched): {actual_error_count}")
-
-    # Calculate how many frames were lost (the "dead" period)
-    missing_count = max(0, expected_error_count - actual_error_count)
-
-    if missing_count > 0:
-        print(f"  > Padding {missing_count} lost frames with infinite error.")
-        print("    (This corrects the AUC to account for early failure)")
-        
-        # Create an array of large errors (10,000.0 is effectively infinite for AUC < 1.0m)
-        padding = np.full(missing_count, 10000.0)
-        
-        # Concatenate the actual errors (from the alive part) with the padding (dead part)
-        rpe_trans_final = np.concatenate((rpe_trans_errors, padding))
-        rpe_rot_final = np.concatenate((rpe_rot_errors, padding))
-    else:
-        rpe_trans_final = rpe_trans_errors
-        rpe_rot_final = rpe_rot_errors
-
-    # Verify length for the metric calculator
+    
+    actual_error_count = len(rpe_trans_errors)
+    print(f"  > Actual Error Samples: {actual_error_count}")
+    
+    rpe_trans_final = rpe_trans_errors
+    rpe_rot_final = rpe_rot_errors
     calc_len = len(rpe_trans_final)
 
     # --- 7. Calculate Metrics ---
     # For single-point results, we pick a "Reasonable" threshold (e.g., x=0.5)
     trans_max = config.get_float('parameters.trans_max_effective_error', 1.0)
     rot_max   = config.get_float('parameters.rot_max_effective_error', 30.0)
-    scale_trans = trans_max / 3.0
-    scale_rot = rot_max / 3.0
-    
-    # Threshold at x=0.5 -> E = -scale * ln(0.5) ~= scale * 0.693
-    trans_mid = -scale_trans * math.log(0.5)
-    rot_mid   = -scale_rot * math.log(0.5)
+    mid_x = 0.5
+    trans_mid = trans_max * math.exp(-10.0 * mid_x)
+    rot_mid   = rot_max * math.exp(-10.0 * mid_x)
 
     fscore_trans, fscore_rot = RobustnessMetric.calc_fscore(
         rpe_trans_final, rpe_rot_final,
-        calc_len, trans_mid, rot_mid
+        total_gt_frames, trans_mid, rot_mid
     )
 
     auc_result = RobustnessMetric.eval_robustness_batch(
         rpe_trans_final, rpe_rot_final,
-        calc_len, config
+        total_gt_frames, config
     )
 
     return fscore_trans, fscore_rot, auc_result

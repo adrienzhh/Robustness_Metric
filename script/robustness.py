@@ -20,15 +20,6 @@ import csv
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-from pyhocon import ConfigFactory
-from evo.core import sync
-from evo.tools import file_interface, plot
-from evo.core import metrics
-from evo.core.trajectory import PosePath3D
-from evo.core.metrics import PoseRelation
-from evo.core.result import Result
-
-import numpy as np
 from scipy.interpolate import interp1d
 
 class RobustnessMetric:
@@ -78,87 +69,44 @@ class RobustnessMetric:
     
     def eval_robustness_batch(rpe_trans, rpe_rots, full_len, config):
         """
-        Evaluate robustness by calculating F-scores across a range of thresholds.
-        Correctly handles independent scaling for Translation (meters) and Rotation (degrees).
+        Evaluate robustness using the original exp(-10 * x) mapping.
+        Strictness s is swept from 0 (loose) to 1 (strict) and thresholds are
+        derived via: T = max_error * exp(-10 * s).
         """
         
-        # --- 1. Load Explicit Thresholds from Config ---
-        
-        # Translation Limits (Meters)
-        t_start = config.get_float('parameters.trans_threshold_start', 0.01) # e.g., 0.01 m
-        t_end   = config.get_float('parameters.trans_threshold_end', 1.0)    # e.g., 1.0 m
-        
-        # Rotation Limits (Degrees)
-        r_start = config.get_float('parameters.rot_threshold_start', 0.1)    # e.g., 0.1 deg
-        r_end   = config.get_float('parameters.rot_threshold_end', 10.0)     # e.g., 10.0 deg
-        
-        # Step size for the sweep (applied to Translation)
-        # Smaller interval = smoother AUC curve
-        t_interval = config.get_float('parameters.threshold_interval', 0.01)
+        trans_max = config.get_float('parameters.trans_max_effective_error', 1.0)
+        rot_max = config.get_float('parameters.rot_max_effective_error', 30.0)
+        s_interval = config.get_float('parameters.threshold_interval', 0.01)
 
         fscore_area_trans = 0.0
         fscore_area_rot = 0.0
         fscore_transes = []
         fscore_rots = []
-        thresholds = []
+        strictness_levels = []
         
-        # We iterate based on the Translation scale (since the paper uses exp(-10*T_trans))
-        current_t = t_start
-        
-        while current_t <= t_end:
-            # --- 2. Calculate Current Thresholds ---
+        current_s = 0.0
+        while current_s <= 1.0 + 1e-9:
+            T_trans = trans_max * math.exp(-10.0 * current_s)
+            T_rot_deg = rot_max * math.exp(-10.0 * current_s)
             
-            # Translation is direct
-            T_trans = current_t
-            
-            # Rotation is Interpolated
-            # Calculate progress ratio (0.0 to 1.0)
-            if t_end != t_start:
-                progress = (current_t - t_start) / (t_end - t_start)
-            else:
-                progress = 1.0
-                
-            # Map progress to Rotation Range
-            T_rot_deg = r_start + progress * (r_end - r_start)
-            
-            # --- 3. Calculate F-Score ---
             fscore_trans, fscore_rot = RobustnessMetric.calc_fscore(
                 rpe_trans, rpe_rots, full_len, T_trans, T_rot_deg
             )
             
-            # --- 4. Calculate Weighting (Paper Formula) ---
-            # The paper uses x = exp(-10 * T) relative to the translation metric.
-            # However, this weighting is extremely aggressive for large error regimes (e.g., Rotation).
-            # We relax this to exp(-2 * T) so that larger errors still contribute to the AUC.
-            
-            # Using -2.0 allows significant contribution even at T=0.5 (exp(-1) ~= 0.36)
-            # whereas -10.0 gave negligible contribution at T=0.5 (exp(-5) ~= 0.006)
-            weight_factor = -10.0 
-            
-            val_minus = math.exp(weight_factor * (current_t - t_interval * 0.5))
-            val_plus  = math.exp(weight_factor * (current_t + t_interval * 0.5))
-            x_axis_len = val_minus - val_plus
-            
-            if (current_t - t_interval * 0.5) < 0.0:
-                x_axis_len = 1.0 - val_plus 
-            
-            if x_axis_len < 0:
-                x_axis_len = 0 # Prevent negative area if step is weird
-                
-            # --- 5. Integrate ---
-            fscore_area_trans += fscore_trans * x_axis_len
-            fscore_area_rot   += fscore_rot   * x_axis_len
+            weight = s_interval
+            fscore_area_trans += fscore_trans * weight
+            fscore_area_rot   += fscore_rot   * weight
             
             fscore_transes.append(fscore_trans)
             fscore_rots.append(fscore_rot)
-            thresholds.append(current_t)
+            strictness_levels.append(current_s)
             
-            current_t += t_interval
+            current_s += s_interval
 
         return {
             'fscore_transes': fscore_transes,
             'fscore_rots': fscore_rots,
-            'thresholds': thresholds,
+            'thresholds': strictness_levels,
             'fscore_area_trans': fscore_area_trans,
             'fscore_area_rot': fscore_area_rot
         }
