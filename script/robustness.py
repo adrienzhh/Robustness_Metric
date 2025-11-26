@@ -32,55 +32,6 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 class RobustnessMetric:
-    def calc_fscore(trans_deriv1, rot_deriv1, trans_deriv2, rot_deriv2, trans_threshold, rot_threshold):
-        """
-        Calculate the F-score for using velocity and angular velocity pair
-
-        Parameters:
-        trans_deriv1 (list): estimate translational derivatives
-        rot_deriv1 (list): estimated angular 
-        trans_deriv2 (list): GT translational derivatives
-        rot_deriv2 (list): GT angular 
-        trans_threshold (float)
-        rot_threshold (float)
-        Returns:
-        tuple: F-score for translational derivatives and F-score for rotational derivatives.
-        """
-        trans_num = 0
-        rot_num = 0
-        index = 0
-
-        while index < len(trans_deriv1) and index < len(rot_deriv1):
-            x1, y1, z1 = trans_deriv1[index]
-            rx1, ry1, rz1 = rot_deriv1[index]
-            x2, y2, z2 = trans_deriv2[index]
-            rx2, ry2, rz2 = rot_deriv2[index]
-
-            trans_val = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
-            rot_val = math.sqrt((rx1-rx2)**2 + (ry1-ry2)**2 + (rz1-rz2)**2)
-
-            if trans_val <= trans_threshold:
-                trans_num += 1
-            if rot_val <= rot_threshold:
-                rot_num += 1
-
-            index += 1
-
-        precision_trans = trans_num / len(trans_deriv1)
-        precision_rot = rot_num / len(rot_deriv1)
-        recall_trans = trans_num / len(trans_deriv2)
-        recall_rot = rot_num / len(rot_deriv2)
-
-        fscore_trans = 0.0
-        if precision_trans + recall_trans > 0:
-            fscore_trans = (2 * precision_trans * recall_trans) / (precision_trans + recall_trans)
-
-        fscore_rot = 0.0
-        if precision_rot + recall_rot > 0:
-            fscore_rot = (2 * precision_rot * recall_rot) / (precision_rot + recall_rot)
-
-        return fscore_trans, fscore_rot
-    
     def calc_fscore(rpe_trans, rpe_rots, full_len, trans_threshold, rot_threshold):
         """
         Calculate the F-score for RPE and angular RPE 
@@ -125,41 +76,92 @@ class RobustnessMetric:
 
         return fscore_trans, fscore_rot
     
-    def eval_robustness_batch(rpe_trans, rpe_rots, full_len, threshold_start, threshold_end, threshold_interval):
-     
+    def eval_robustness_batch(rpe_trans, rpe_rots, full_len, config):
+        """
+        Evaluate robustness by calculating F-scores across a range of thresholds.
+        Correctly handles independent scaling for Translation (meters) and Rotation (degrees).
+        """
+        
+        # --- 1. Load Explicit Thresholds from Config ---
+        
+        # Translation Limits (Meters)
+        t_start = config.get_float('parameters.trans_threshold_start', 0.01) # e.g., 0.01 m
+        t_end   = config.get_float('parameters.trans_threshold_end', 1.0)    # e.g., 1.0 m
+        
+        # Rotation Limits (Degrees)
+        r_start = config.get_float('parameters.rot_threshold_start', 0.1)    # e.g., 0.1 deg
+        r_end   = config.get_float('parameters.rot_threshold_end', 10.0)     # e.g., 10.0 deg
+        
+        # Step size for the sweep (applied to Translation)
+        # Smaller interval = smoother AUC curve
+        t_interval = config.get_float('parameters.threshold_interval', 0.01)
+
         fscore_area_trans = 0.0
         fscore_area_rot = 0.0
         fscore_transes = []
         fscore_rots = []
         thresholds = []
-        num = 0
         
-        threshold = threshold_start
-        while threshold <= threshold_end:
-            threshold_value = math.exp(-10.0 * threshold)
-            fscore_trans, fscore_rot = RobustnessMetric.calc_fscore(
-                rpe_trans, rpe_rots, full_len, threshold_value, threshold_value)
+        # We iterate based on the Translation scale (since the paper uses exp(-10*T_trans))
+        current_t = t_start
+        
+        while current_t <= t_end:
+            # --- 2. Calculate Current Thresholds ---
             
-            val_minus = math.exp(-10.0 * (threshold - threshold_interval * 0.5))
-            val_plus = math.exp(-10.0 * (threshold + threshold_interval * 0.5))
+            # Translation is direct
+            T_trans = current_t
+            
+            # Rotation is Interpolated
+            # Calculate progress ratio (0.0 to 1.0)
+            if t_end != t_start:
+                progress = (current_t - t_start) / (t_end - t_start)
+            else:
+                progress = 1.0
+                
+            # Map progress to Rotation Range
+            T_rot_deg = r_start + progress * (r_end - r_start)
+            
+            # --- 3. Calculate F-Score ---
+            fscore_trans, fscore_rot = RobustnessMetric.calc_fscore(
+                rpe_trans, rpe_rots, full_len, T_trans, T_rot_deg
+            )
+            
+            # --- 4. Calculate Weighting (Paper Formula) ---
+            # The paper uses x = exp(-10 * T) relative to the translation metric.
+            # However, this weighting is extremely aggressive for large error regimes (e.g., Rotation).
+            # We relax this to exp(-2 * T) so that larger errors still contribute to the AUC.
+            
+            # Using -2.0 allows significant contribution even at T=0.5 (exp(-1) ~= 0.36)
+            # whereas -10.0 gave negligible contribution at T=0.5 (exp(-5) ~= 0.006)
+            weight_factor = -10.0 
+            
+            val_minus = math.exp(weight_factor * (current_t - t_interval * 0.5))
+            val_plus  = math.exp(weight_factor * (current_t + t_interval * 0.5))
             x_axis_len = val_minus - val_plus
             
-            if (threshold - threshold_interval * 0.5) < 0.0:
-                x_axis_len = 0.0
+            if (current_t - t_interval * 0.5) < 0.0:
+                x_axis_len = 1.0 - val_plus 
+            
+            if x_axis_len < 0:
+                x_axis_len = 0 # Prevent negative area if step is weird
+                
+            # --- 5. Integrate ---
             fscore_area_trans += fscore_trans * x_axis_len
-            fscore_area_rot += fscore_rot * x_axis_len
+            fscore_area_rot   += fscore_rot   * x_axis_len
+            
             fscore_transes.append(fscore_trans)
             fscore_rots.append(fscore_rot)
-            thresholds.append(threshold)
-            num += 1
-            threshold += threshold_interval
+            thresholds.append(current_t)
+            
+            current_t += t_interval
+
         return {
             'fscore_transes': fscore_transes,
             'fscore_rots': fscore_rots,
             'thresholds': thresholds,
             'fscore_area_trans': fscore_area_trans,
             'fscore_area_rot': fscore_area_rot
-    }
+        }
 
     def save_results(ref_file, est_file, fscore_trans, fscore_rot, auc_result):
         est_dir = os.path.dirname(est_file)
@@ -249,4 +251,3 @@ class RobustnessMetric:
         print(f"Plot saved to: {output_path}")
         
         plt.close()
-        

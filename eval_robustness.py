@@ -180,14 +180,7 @@ def format_results(auc_result):
 def process_trajectory_pair(ref_file, est_file, config):
     # --- 1. Load Configuration ---
     # Default values are safe safeguards if config is missing keys
-    trans_threshold = config.get_float('parameters.trans_threshold', 0.01)
-    rot_threshold = config.get_float('parameters.rot_threshold', 0.01)
-    
-    threshold_start = config.get_float('parameters.threshold_start', 0.0)
-    threshold_end = config.get_float('parameters.threshold_end', 1.0)
-    # Ensure interval is not zero to avoid infinite loops
-    threshold_interval = config.get('parameters.threshold_interval', 
-                                    threshold_start if threshold_start > 0 else 0.01)
+
 
     # --- 2. Read Files ---
     traj_ref = read_trajectory_file(ref_file)
@@ -242,14 +235,33 @@ def process_trajectory_pair(ref_file, est_file, config):
     )
     rpe_rot_errors = result_rot.np_arrays["error_array"]
 
-    # --- 6. [THE FIX] Pad Missing Frames with High Error ---
-    # We compare the number of errors we got vs the number of errors expected 
-    # if the robot had completed the full 32m trajectory.
+    # DEBUG: Print RPE statistics
+    print(f"  [DEBUG] RPE Translation Stats: Min={np.min(rpe_trans_errors):.4f}, Mean={np.mean(rpe_trans_errors):.4f}, Max={np.max(rpe_trans_errors):.4f}")
+    print(f"  [DEBUG] RPE Rotation Stats:    Min={np.min(rpe_rot_errors):.4f}, Mean={np.mean(rpe_rot_errors):.4f}, Max={np.max(rpe_rot_errors):.4f}")
+
+    # --- 6. [THE FIX] Pad Missing Frames based on Duration ---
+    # Instead of expecting every single GT frame, we expect the estimation 
+    # to maintain its own frequency over the full duration of the GT.
+
+    gt_duration = traj_ref.timestamps[-1] - traj_ref.timestamps[0]
+    est_duration = traj_est.timestamps[-1] - traj_est.timestamps[0]
     
-    # RPE (delta=1) produces (N-1) errors for N frames.
-    expected_error_count = total_gt_frames - 1
+    # Calculate density (intervals per second) of the estimated trajectory
+    # Avoid division by zero
+    if est_duration > 1e-6:
+        est_rate = (len(traj_est.timestamps) - 1) / est_duration
+    else:
+        est_rate = 0.0
+
+    # Calculate expected number of intervals if the estimation covered the full GT duration
+    expected_error_count = int(est_rate * gt_duration)
+
     actual_error_count = len(rpe_trans_errors)
     
+    print(f"  > Duration GT: {gt_duration:.2f}s, Est: {est_duration:.2f}s")
+    print(f"  > Expected Count (Duration-based): {expected_error_count}")
+    print(f"  > Actual Count (Matched): {actual_error_count}")
+
     # Calculate how many frames were lost (the "dead" period)
     missing_count = max(0, expected_error_count - actual_error_count)
 
@@ -271,6 +283,10 @@ def process_trajectory_pair(ref_file, est_file, config):
     calc_len = len(rpe_trans_final)
 
     # --- 7. Calculate Metrics ---
+    # We use the config-defined limits for the single-point result (usually the strict end)
+    trans_threshold = config.get_float('parameters.trans_threshold_end', 1.0)
+    rot_threshold = config.get_float('parameters.rot_threshold_end', 10.0)
+
     fscore_trans, fscore_rot = RobustnessMetric.calc_fscore(
         rpe_trans_final, rpe_rot_final,
         calc_len, trans_threshold, rot_threshold
@@ -278,7 +294,7 @@ def process_trajectory_pair(ref_file, est_file, config):
 
     auc_result = RobustnessMetric.eval_robustness_batch(
         rpe_trans_final, rpe_rot_final,
-        calc_len, threshold_start, threshold_end, threshold_interval
+        calc_len, config
     )
 
     return fscore_trans, fscore_rot, auc_result
